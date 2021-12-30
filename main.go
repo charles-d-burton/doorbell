@@ -93,58 +93,34 @@ func main() {
 	}
 }
 
-func (doorbell *Doorbell) randomTimer() chan struct{} {
-	randomizer := make(chan struct{}, 1)
-	go func() {
-		for {
-			rand.Seed(time.Now().UnixNano())
-			randInterval := rand.Intn(10)
-			time.Sleep(time.Duration(randInterval) * time.Second)
-			randomizer <- struct{}{}
-		}
-	}()
-
-	return randomizer
-}
-
+//Currently don't have a clean way to shut this down.  Need to think about it
 func (doorbell *Doorbell) flicker(ctx context.Context) {
 	fmt.Println("starting flickering lights")
 	for idx, pin := range doorbell.FlickerPins {
 		go func(ctx context.Context, p gpio.PinIO, pinid int) {
-			randomizer := doorbell.randomTimer()
 			for {
-				select {
-				case <-ctx.Done():
-					fmt.Println("stopping flicker pin: ", pinid)
-
-					if err := p.Halt(); err != nil {
+				rand.Seed(time.Now().UnixNano())
+				randpwm := rand.Intn((maxPWM - minPWM + 1) + minPWM)
+				randInterval := rand.Intn(10)
+				for i := minPWM; i < randpwm; i++ {
+					freq := physic.Frequency(i)
+					if err := p.PWM(gpio.DutyHalf, freq*physic.Hertz); err != nil {
 						log.Fatal(err)
 					}
-					return
-
-				case <-randomizer:
-
-					rand.Seed(time.Now().UnixNano())
-					randpwm := rand.Intn((maxPWM - minPWM + 1) + minPWM)
-					for i := minPWM; i < randpwm; i++ {
-						freq := physic.Frequency(i)
-						if err := p.PWM(gpio.DutyHalf, freq*physic.Hertz); err != nil {
-							log.Fatal(err)
-						}
-						time.Sleep(200 * time.Millisecond)
-					}
-					for i := randpwm; i > minPWM; i-- {
-						freq := physic.Frequency(i)
-						if err := p.PWM(gpio.DutyHalf, freq*physic.Hertz); err != nil {
-							log.Fatal(err)
-						}
-						time.Sleep(200 * time.Millisecond)
-					}
-
-					if err := p.Halt(); err != nil {
-						log.Fatal(err)
-					}
+					time.Sleep(200 * time.Millisecond)
 				}
+				for i := randpwm; i > minPWM; i-- {
+					freq := physic.Frequency(i)
+					if err := p.PWM(gpio.DutyHalf, freq*physic.Hertz); err != nil {
+						log.Fatal(err)
+					}
+					time.Sleep(200 * time.Millisecond)
+				}
+
+				if err := p.Halt(); err != nil {
+					log.Fatal(err)
+				}
+				time.Sleep(time.Duration(randInterval) * time.Second)
 			}
 		}(ctx, pin, idx)
 	}
