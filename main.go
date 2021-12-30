@@ -35,8 +35,9 @@ type Doorbell struct {
 }
 
 type Device struct {
-	Addr string
-	Port int
+	LastSeen time.Time
+	Addr     string
+	Port     int
 
 	Name string
 	Host string
@@ -56,7 +57,6 @@ func main() {
 
 	var doorbell Doorbell
 	doorbell.FlickerPins = make([]gpio.PinIO, 2)
-	doorbell.Devices = make(map[string]Device, 0)
 
 	pwm1 := gpioreg.ByName("PWM1_OUT")
 	if pwm1 == nil {
@@ -72,10 +72,11 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	doorbell.flicker(ctx)
+	doorbell.getDevices(ctx)
 
 	doorbell.waitForButton(ctx)
 
-	doorbell.setGoogleHomeAddrs(ctx)
+	//doorbell.setGoogleHomeAddrs(ctx)
 
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, syscall.SIGHUP, syscall.SIGINT, syscall.SIGTERM, syscall.SIGQUIT)
@@ -149,7 +150,9 @@ func (doorbell *Doorbell) pinListener() chan gpio.Level {
 			p.WaitForEdge(-1)
 			read := p.Read()
 			fmt.Printf("-> %s\n", read)
-			readings <- read
+			if read == gpio.Low {
+				readings <- read
+			}
 		}
 	}()
 
@@ -171,32 +174,13 @@ func (doorbell *Doorbell) waitForButton(ctx context.Context) {
 				return
 			case reading := <-readings:
 				currentReading := time.Now()
-				if currentReading.Sub(lastReading).Seconds() > 30 {
+				if currentReading.Sub(lastReading).Seconds() > 10 {
 					fmt.Printf("select -> %s\n", reading)
 					lastReading = time.Now()
-					doorbell.Lock()
-
-					for _, device := range doorbell.Devices {
-						//Select certain speakers between 8PM and 8AM
-						if currentReading.Hour() < 7 || currentReading.Hour() > 19 {
-							fmt.Println("playing on subset of speakers")
-							if strings.Contains(device.DeviceName, "Kitchen") || strings.Contains(device.DeviceName, "Bedroom") {
-								if err := doorbell.connectDevice(device); err != nil {
-									fmt.Println(err.Error())
-								}
-							}
-						} else {
-							if !strings.Contains(device.Name, "Group") {
-								//yeet
-								go func() {
-									if err := doorbell.connectDevice(device); err != nil {
-										fmt.Println(err.Error())
-									}
-								}()
-							}
-						}
+					if err := doorbell.broadcast(ctx); err != nil {
+						fmt.Printf("problem broadcasting %v\n", err)
 					}
-					doorbell.Unlock()
+
 				}
 			}
 		}
@@ -229,19 +213,55 @@ func (doorbell *Doorbell) waitForButton(ctx context.Context) {
 	}*/
 }
 
-//setGoogleHomeAddrs scans the network every hour looking for devices
-func (doorbell *Doorbell) setGoogleHomeAddrs(ctx context.Context) {
-	go func(ctx context.Context) {
-
-		iface, err := getNetworkInterface()
-		if err != nil {
-			log.Fatal(err)
+//creating a new application every run, maybe inefficient?
+func (doorbell *Doorbell) broadcast(ctx context.Context) error {
+	currentReading := time.Now()
+	fmt.Printf("found %d devices\n", len(doorbell.Devices))
+	doorbell.RLock()
+	defer doorbell.RUnlock()
+	for _, device := range doorbell.Devices {
+		//Select certain speakers between 8PM and 8AM
+		if currentReading.Hour() < 7 || currentReading.Hour() > 19 {
+			fmt.Println("playing on subset of speakers")
+			if strings.Contains(device.DeviceName, "Kitchen") || strings.Contains(device.DeviceName, "Bedroom") {
+				if err := playMedia(device); err != nil {
+					fmt.Println(err.Error())
+				}
+			}
+		} else {
+			if !strings.Contains(device.Device, "Group") {
+				fmt.Printf("playing on device %s\n", device.DeviceName)
+				//yeet
+				if err := playMedia(device); err != nil {
+					fmt.Println(err.Error())
+					//return err
+				}
+			}
 		}
-		fmt.Printf("found iface: %s\n", iface.Name)
-		ticker := time.NewTicker(1 * time.Hour)
-		for ; true; <-ticker.C { //Trick to get the ticker to fire once immediately and then every hour after
+	}
+	return nil
+}
+
+//scan network for devices
+func (doorbell *Doorbell) getDevices(ctx context.Context) {
+	doorbell.Lock()
+	defer doorbell.Unlock()
+	doorbell.Devices = make(map[string]Device, 0)
+
+	go func(ctx context.Context) {
+		ticker := time.NewTicker(1 * time.Minute)
+		for ; true; <-ticker.C {
+
+			iface, err := getNetworkInterface()
+			if err != nil {
+				log.Fatal(err)
+			}
+			fmt.Printf("found iface: %s\n", iface.Name)
 			fmt.Println("finding google home devices")
-			castEntryChan, err := castdns.DiscoverCastDNSEntries(ctx, iface)
+
+			toctx, cancel := context.WithTimeout(ctx, 3*time.Second) //set channel timeout
+			defer cancel()
+			castEntryChan, err := castdns.DiscoverCastDNSEntries(toctx, iface)
 			if err != nil {
 				fmt.Printf("unable to discover chromecast devices: %v\n", err)
 			}
@@ -258,17 +278,29 @@ func (doorbell *Doorbell) setGoogleHomeAddrs(ctx context.Context) {
 					Status:     d.Status,
 					DeviceName: d.DeviceName,
 					InfoFields: d.InfoFields,
+					LastSeen:   time.Now(),
 				}
 				doorbell.Lock()
-				doorbell.Devices[d.UUID] = device
+				doorbell.Devices[device.UUID] = device
 				doorbell.Unlock()
 			}
+
+			//GC the old devices
+			doorbell.Lock()
+			for key, device := range doorbell.Devices {
+				currentTime := time.Now()
+				if currentTime.Sub(device.LastSeen).Seconds() > 60 {
+					fmt.Printf("removing old device: %s\n", device.DeviceName)
+					delete(doorbell.Devices, key)
+				}
+			}
+			doorbell.Unlock()
 		}
 	}(ctx)
 }
 
-//creating a new application every run, maybe inefficient?
-func (doorbell *Doorbell) connectDevice(d Device) error {
+//play the media
+func playMedia(d Device) error {
 	fmt.Println("connecting to device: ", d.DeviceName)
 	appOptions := []application.ApplicationOption{
 		application.WithDebug(true),
@@ -276,20 +308,37 @@ func (doorbell *Doorbell) connectDevice(d Device) error {
 	}
 
 	app := application.NewApplication(appOptions...)
+
+	defer func() {
+		if err := app.Close(false); err != nil {
+			fmt.Printf("unable to close application %q: %v", d.UUID, err)
+		}
+
+	}()
+
 	if err := app.Start(d.Addr, d.Port); err != nil {
 		return fmt.Errorf("unable to start application: %v", err)
 	}
 
-	if err := app.Load(mp3URL, "", true, true, true); err != nil {
-		fmt.Printf("unable to load media for device: %v\n", err)
+	app.Stop()
+	app.StopMedia()
+
+	volume := app.Volume().Level
+
+	if err := app.SetVolume(1); err != nil {
+		return fmt.Errorf("unable to get volume: %v\n", err)
 	}
 
-	if err := app.Close(false); err != nil {
-		return fmt.Errorf("unable to close application %q: %v", d.UUID, err)
+	if err := app.Load(mp3URL, "", true, true, true); err != nil {
+		return fmt.Errorf("unable to load media for device: %v\n", err)
 	}
+
+	app.SetVolume(volume)
+
 	return nil
 }
 
+//Helper to get network interfaces for discovery
 func getNetworkInterface() (*net.Interface, error) {
 	interfaces, err := net.Interfaces()
 	if err != nil {
