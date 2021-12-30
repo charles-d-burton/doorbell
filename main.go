@@ -9,9 +9,11 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"github.com/vishen/go-chromecast/application"
 	castdns "github.com/vishen/go-chromecast/dns"
 	"periph.io/x/conn/v3/gpio"
 	"periph.io/x/conn/v3/gpio/gpioreg"
@@ -27,7 +29,7 @@ const (
 )
 
 type Doorbell struct {
-	//SensorPin   gpio.PinIO
+	sync.RWMutex
 	FlickerPins []gpio.PinIO
 	Devices     map[string]Device
 }
@@ -193,13 +195,37 @@ func (doorbell *Doorbell) waitForButton(ctx context.Context) {
 				return
 			case reading := <-readings:
 				currentReading := time.Now()
-				if currentReading.Sub(lastReading).Seconds() > 1 {
+				if currentReading.Sub(lastReading).Seconds() > 30 {
 					fmt.Printf("select -> %s\n", reading)
 					lastReading = time.Now()
+					doorbell.Lock()
+
+					for _, device := range doorbell.Devices {
+						//Select certain speakers between 8PM and 8AM
+						if currentReading.Hour() < 7 || currentReading.Hour() > 19 {
+							fmt.Println("playing on subset of speakers")
+							if strings.Contains(device.DeviceName, "Kitchen") || strings.Contains(device.DeviceName, "Bedroom") {
+								if err := doorbell.connectDevice(device); err != nil {
+									fmt.Println(err.Error())
+								}
+							}
+						} else {
+							if !strings.Contains(device.Name, "Group") {
+								//yeet
+								go func() {
+									if err := doorbell.connectDevice(device); err != nil {
+										fmt.Println(err.Error())
+									}
+								}()
+							}
+						}
+					}
+					doorbell.Unlock()
 				}
 			}
 		}
 	}(ctx)
+	//Keeping this here for now, might revisit later for a notification system to alert phones too
 	/*dataMap := make(map[string]map[string]bool, 1)
 	var buf bytes.Buffer
 	for {
@@ -227,41 +253,65 @@ func (doorbell *Doorbell) waitForButton(ctx context.Context) {
 	}*/
 }
 
+//setGoogleHomeAddrs scans the network every hour looking for devices
 func (doorbell *Doorbell) setGoogleHomeAddrs(ctx context.Context) {
 	go func(ctx context.Context) {
+
 		iface, err := getNetworkInterface()
 		if err != nil {
 			log.Fatal(err)
 		}
-		fmt.Printf("found iface: %s", iface.Name)
-		castEntryChan, err := castdns.DiscoverCastDNSEntries(ctx, iface)
-		if err != nil {
-			fmt.Printf("unable to discover chromecast devices: %v\n", err)
-		}
-		for d := range castEntryChan {
-			fmt.Printf("device=%q device_name=%q address=\"%s:%d\" uuid=%q\n", d.Device, d.DeviceName, d.AddrV4, d.Port, d.UUID)
-
-			device := Device{
-				Addr:       d.AddrV4.String(),
-				Port:       d.Port,
-				Name:       d.Name,
-				Host:       d.Host,
-				UUID:       d.UUID,
-				Device:     d.Device,
-				Status:     d.Status,
-				DeviceName: d.DeviceName,
-				InfoFields: d.InfoFields,
-			}
-
-			doorbell.Devices[d.Name] = device
-			/*rchan := make(chan *pb.CastMessage, 10)
-			conn := cast.NewConnection(rchan)
-			err := conn.Start(d.AddrV4.String(), d.Port)
+		fmt.Printf("found iface: %s\n", iface.Name)
+		ticker := time.NewTicker(1 * time.Hour)
+		for ; true; <-ticker.C { //Trick to get the ticker to fire once immediately and then every hour after
+			fmt.Println("finding google home devices")
+			castEntryChan, err := castdns.DiscoverCastDNSEntries(ctx, iface)
 			if err != nil {
-				fmt.Errorf("problem connecting to chromecase %w\n", err)
-			}*/
+				fmt.Printf("unable to discover chromecast devices: %v\n", err)
+			}
+			for d := range castEntryChan {
+				fmt.Printf("device=%q device_name=%q address=\"%s:%d\" uuid=%q\n", d.Device, d.DeviceName, d.AddrV4, d.Port, d.UUID)
+
+				device := Device{
+					Addr:       d.AddrV4.String(),
+					Port:       d.Port,
+					Name:       d.Name,
+					Host:       d.Host,
+					UUID:       d.UUID,
+					Device:     d.Device,
+					Status:     d.Status,
+					DeviceName: d.DeviceName,
+					InfoFields: d.InfoFields,
+				}
+				doorbell.Lock()
+				doorbell.Devices[d.UUID] = device
+				doorbell.Unlock()
+			}
 		}
 	}(ctx)
+}
+
+//creating a new application every run, maybe inefficient?
+func (doorbell *Doorbell) connectDevice(d Device) error {
+	fmt.Println("connecting to device: ", d.DeviceName)
+	appOptions := []application.ApplicationOption{
+		application.WithDebug(true),
+		application.WithCacheDisabled(true),
+	}
+
+	app := application.NewApplication(appOptions...)
+	if err := app.Start(d.Addr, d.Port); err != nil {
+		return fmt.Errorf("unable to start application: %v", err)
+	}
+
+	if err := app.Load(mp3URL, "", true, true, true); err != nil {
+		fmt.Printf("unable to load media for device: %v\n", err)
+	}
+
+	if err := app.Close(false); err != nil {
+		return fmt.Errorf("unable to close application %q: %v", d.UUID, err)
+	}
+	return nil
 }
 
 func getNetworkInterface() (*net.Interface, error) {
