@@ -1,0 +1,14 @@
+[Unit]
+Description=Doorbell
+After=network.target
+[Service]
+Type=simple
+WorkingDirectory=/tmp
+ExecStart=/usr/local/bin/doorbell
+Restart=on-failure
+RestartSec=10
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=doorbell
+[Install]
+WantedBy=multi-user.target

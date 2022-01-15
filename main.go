@@ -31,7 +31,7 @@ const (
 type Doorbell struct {
 	sync.RWMutex
 	FlickerPins []gpio.PinIO
-	Devices     map[string]Device
+	Devices     map[string]*Device
 }
 
 type Device struct {
@@ -217,14 +217,14 @@ func (doorbell *Doorbell) waitForButton(ctx context.Context) {
 func (doorbell *Doorbell) broadcast(ctx context.Context) error {
 	currentReading := time.Now()
 	fmt.Printf("found %d devices\n", len(doorbell.Devices))
-	doorbell.RLock()
-	defer doorbell.RUnlock()
+	doorbell.Lock()
+	defer doorbell.Unlock()
 	for _, device := range doorbell.Devices {
 		//Select certain speakers between 8PM and 8AM
 		if currentReading.Hour() < 7 || currentReading.Hour() > 19 {
 			fmt.Println("playing on subset of speakers")
 			if strings.Contains(device.DeviceName, "Kitchen") || strings.Contains(device.DeviceName, "Bedroom") {
-				if err := playMedia(device); err != nil {
+				if err := device.playMedia(); err != nil {
 					fmt.Println(err.Error())
 				}
 			}
@@ -232,7 +232,7 @@ func (doorbell *Doorbell) broadcast(ctx context.Context) error {
 			if !strings.Contains(device.Device, "Group") {
 				fmt.Printf("playing on device %s\n", device.DeviceName)
 				//yeet
-				if err := playMedia(device); err != nil {
+				if err := device.playMedia(); err != nil {
 					fmt.Println(err.Error())
 					//return err
 				}
@@ -243,25 +243,25 @@ func (doorbell *Doorbell) broadcast(ctx context.Context) error {
 }
 
 //scan network for devices
-func (doorbell *Doorbell) getDevices(ctx context.Context) {
-	doorbell.Lock()
-	defer doorbell.Unlock()
-	doorbell.Devices = make(map[string]Device, 0)
+func (d *Doorbell) getDevices(ctx context.Context) {
+	d.Lock()
+	d.Devices = make(map[string]*Device, 0)
+	d.Unlock()
 
-	go func(ctx context.Context) {
-		ticker := time.NewTicker(1 * time.Minute)
+	iface, err := getNetworkInterface()
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Printf("found iface: %s\n", iface.Name)
+
+	go func(ctx context.Context, niface *net.Interface, doorbell *Doorbell) {
+		ticker := time.NewTicker(10 * time.Second)
 		for ; true; <-ticker.C {
-
-			iface, err := getNetworkInterface()
-			if err != nil {
-				log.Fatal(err)
-			}
-			fmt.Printf("found iface: %s\n", iface.Name)
 			fmt.Println("finding google home devices")
 
 			toctx, cancel := context.WithTimeout(ctx, 3*time.Second) //set channel timeout
 			defer cancel()
-			castEntryChan, err := castdns.DiscoverCastDNSEntries(toctx, iface)
+			castEntryChan, err := castdns.DiscoverCastDNSEntries(toctx, niface)
 			if err != nil {
 				fmt.Printf("unable to discover chromecast devices: %v\n", err)
 			}
@@ -281,26 +281,18 @@ func (doorbell *Doorbell) getDevices(ctx context.Context) {
 					LastSeen:   time.Now(),
 				}
 				doorbell.Lock()
-				doorbell.Devices[device.UUID] = device
+				doorbell.Devices[device.UUID] = &device
 				doorbell.Unlock()
 			}
-
-			//GC the old devices
-			doorbell.Lock()
-			for key, device := range doorbell.Devices {
-				currentTime := time.Now()
-				if currentTime.Sub(device.LastSeen).Seconds() > 60 {
-					fmt.Printf("removing old device: %s\n", device.DeviceName)
-					delete(doorbell.Devices, key)
-				}
-			}
-			doorbell.Unlock()
 		}
-	}(ctx)
+	}(ctx, iface, d)
 }
 
 //play the media
-func playMedia(d Device) error {
+func (d *Device) playMedia() error {
+	if d == nil {
+		return fmt.Errorf("device nil\n")
+	}
 	fmt.Println("connecting to device: ", d.DeviceName)
 	appOptions := []application.ApplicationOption{
 		application.WithDebug(true),
