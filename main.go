@@ -255,7 +255,7 @@ func (d *Doorbell) getDevices(ctx context.Context) {
 	fmt.Printf("found iface: %s\n", iface.Name)
 
 	go func(ctx context.Context, niface *net.Interface, doorbell *Doorbell) {
-		ticker := time.NewTicker(10 * time.Second)
+		ticker := time.NewTicker(60 * time.Second)
 		for ; true; <-ticker.C {
 			fmt.Println("finding google home devices")
 
