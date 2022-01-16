@@ -35,9 +35,10 @@ type Doorbell struct {
 }
 
 type Device struct {
-	LastSeen time.Time
-	Addr     string
-	Port     int
+	LastSeen       time.Time
+	FailedConnects int
+	Addr           string
+	Port           int
 
 	Name string
 	Host string
@@ -215,30 +216,38 @@ func (doorbell *Doorbell) waitForButton(ctx context.Context) {
 
 //creating a new application every run, maybe inefficient?
 func (doorbell *Doorbell) broadcast(ctx context.Context) error {
-	currentReading := time.Now()
 	fmt.Printf("found %d devices\n", len(doorbell.Devices))
 	doorbell.Lock()
 	defer doorbell.Unlock()
-	for _, device := range doorbell.Devices {
+
+	var wg sync.WaitGroup
+	for id, device := range doorbell.Devices {
 		//Select certain speakers between 8PM and 8AM
-		if currentReading.Hour() < 7 || currentReading.Hour() > 19 {
-			fmt.Println("playing on subset of speakers")
-			if strings.Contains(device.DeviceName, "Kitchen") || strings.Contains(device.DeviceName, "Bedroom") {
-				if err := device.playMedia(); err != nil {
-					fmt.Println(err.Error())
+		wg.Add(1)
+		go func(waitgroup *sync.WaitGroup, deviceID string, dDevice *Device) {
+			defer waitgroup.Done()
+			currentReading := time.Now()
+			if currentReading.Hour() < 7 || currentReading.Hour() > 19 {
+				fmt.Println("playing on subset of speakers")
+				if strings.Contains(dDevice.DeviceName, "Kitchen") || strings.Contains(dDevice.DeviceName, "Bedroom") {
+					if err := dDevice.playMedia(); err != nil {
+						fmt.Println(err.Error())
+					}
+				}
+			} else {
+				if !strings.Contains(dDevice.Device, "Group") {
+					fmt.Printf("playing on device %s\n", dDevice.DeviceName)
+					//yeet
+					if err := dDevice.playMedia(); err != nil {
+						//TODO: Write a function to parse this and GC old devices
+						dDevice.FailedConnects++
+						fmt.Println(err.Error())
+					}
 				}
 			}
-		} else {
-			if !strings.Contains(device.Device, "Group") {
-				fmt.Printf("playing on device %s\n", device.DeviceName)
-				//yeet
-				if err := device.playMedia(); err != nil {
-					fmt.Println(err.Error())
-					//return err
-				}
-			}
-		}
+		}(&wg, id, device)
 	}
+	wg.Wait()
 	return nil
 }
 
