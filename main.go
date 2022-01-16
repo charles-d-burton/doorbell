@@ -72,7 +72,8 @@ func main() {
 	doorbell.FlickerPins[1] = pwm2
 
 	ctx, cancel := context.WithCancel(context.Background())
-	doorbell.flicker(ctx)
+	pinshut := make(chan bool, 1)
+	doorbell.flicker(ctx, pinshut)
 	doorbell.getDevices(ctx)
 
 	doorbell.waitForButton(ctx)
@@ -85,49 +86,57 @@ func main() {
 	case <-sigc:
 		fmt.Println("received stop signal")
 		cancel()
-		if err := pwm1.Halt(); err != nil {
-			log.Fatal(err)
-		}
-		if err := pwm2.Halt(); err != nil {
-			log.Fatal(err)
+		for _, pin := range doorbell.FlickerPins {
+			<-pinshut
+			fmt.Printf("pin: %v shutdown", pin.Name())
 		}
 		os.Exit(0)
 	}
 }
 
-//Currently don't have a clean way to shut this down.  Need to think about it
-func (doorbell *Doorbell) flicker(ctx context.Context) {
+//Start go routine to pulse the LED pins and make them lightup/flicker
+func (doorbell *Doorbell) flicker(ctx context.Context, pinshut chan bool) {
 	fmt.Println("starting flickering lights")
 	for idx, pin := range doorbell.FlickerPins {
 		go func(ctx context.Context, p gpio.PinIO, pinid int) {
+			defer func() { pinshut <- true }() //ensure that the shutdown command is sent
 			for {
-				rand.Seed(time.Now().UnixNano())
-				randpwm := rand.Intn((maxPWM - minPWM + 1) + minPWM)
-				randInterval := rand.Intn(10)
-				for i := minPWM; i < randpwm; i++ {
-					freq := physic.Frequency(i)
-					if err := p.PWM(gpio.DutyHalf, freq*physic.Hertz); err != nil {
+				select {
+				case <-ctx.Done():
+					if err := p.Halt(); err != nil {
 						log.Fatal(err)
 					}
-					time.Sleep(200 * time.Millisecond)
-				}
-				for i := randpwm; i > minPWM; i-- {
-					freq := physic.Frequency(i)
-					if err := p.PWM(gpio.DutyHalf, freq*physic.Hertz); err != nil {
-						log.Fatal(err)
+					return
+				default:
+					rand.Seed(time.Now().UnixNano())
+					randpwm := rand.Intn((maxPWM - minPWM + 1) + minPWM)
+					randInterval := rand.Intn(10)
+					for i := minPWM; i < randpwm; i++ {
+						freq := physic.Frequency(i)
+						if err := p.PWM(gpio.DutyHalf, freq*physic.Hertz); err != nil {
+							log.Fatal(err)
+						}
+						time.Sleep(200 * time.Millisecond)
 					}
-					time.Sleep(200 * time.Millisecond)
-				}
+					for i := randpwm; i > minPWM; i-- {
+						freq := physic.Frequency(i)
+						if err := p.PWM(gpio.DutyHalf, freq*physic.Hertz); err != nil {
+							log.Fatal(err)
+						}
+						time.Sleep(200 * time.Millisecond)
+					}
 
-				if err := p.Halt(); err != nil {
-					log.Fatal(err)
+					if err := p.Halt(); err != nil {
+						log.Fatal(err)
+					}
+					time.Sleep(time.Duration(randInterval) * time.Second)
 				}
-				time.Sleep(time.Duration(randInterval) * time.Second)
 			}
 		}(ctx, pin, idx)
 	}
 }
 
+//Listen for incoming button presses
 func (doorbell *Doorbell) pinListener() chan gpio.Level {
 	readings := make(chan gpio.Level, 10)
 	go func() {
